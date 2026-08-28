@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lector QR — Asistencia</title>
+
+<!-- ===== PWA: instalable como app, pantalla completa, ícono propio ===== -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0f172a">
+<!-- Android/Chrome -->
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<!-- iOS/Safari: hace que "Agregar a inicio" abra sin barra de navegador -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Lector QR">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin:0; padding:16px; background:#0f172a; color:#e2e8f0; }
+  h3 { text-align:center; font-size:16px; margin:0 0 14px; }
+  #qr-reader { width:100%; max-width:420px; margin:0 auto; border-radius:12px; overflow:hidden; }
+  .estado { text-align:center; margin-top:14px; font-size:14px; color:#94a3b8; }
+  .resultado { border-radius:10px; padding:16px; font-size:15px; margin-top:14px; text-align:center; }
+  .ok { background:#052e16; color:#bbf7d0; border:1px solid #14532d; }
+  .error { background:#450a0a; color:#fecaca; border:1px solid #7f1d1d; }
+  .nombre { font-weight:700; font-size:17px; margin-bottom:4px; }
+  input, button { font-size:15px; }
+  #inputManual { width:100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #334155; background:#1e293b; color:#e2e8f0; margin-top:6px; }
+  .fila { display:flex; gap:8px; margin-top:6px; }
+  .fila input { flex:1; }
+  button { padding:10px 14px; border:none; border-radius:8px; background:#334155; color:#fff; font-weight:600; cursor:pointer; }
+  button:hover { background:#475569; }
+  label { font-size:13px; color:#94a3b8; }
+  .toggle { display:flex; gap:8px; margin:0 auto 14px; max-width:420px; }
+  .toggle button { flex:1; padding:12px; border-radius:10px; background:#1e293b; border:2px solid #334155; font-size:16px; }
+  .toggle button.activo-entrada { background:#052e16; border-color:#16a34a; color:#bbf7d0; }
+  .toggle button.activo-salida { background:#450a0a; border-color:#dc2626; color:#fecaca; }
+  .toggle button.btn-cerrar { flex:0 0 auto; padding:12px 14px; font-size:14px; color:#94a3b8; }
+  .toggle button.btn-cerrar:hover { background:#334155; color:#fecaca; border-color:#7f1d1d; }
+</style>
+</head>
+<body>
+  <h3>📷 Lector QR — Control de Asistencia</h3>
+
+  <div class="toggle">
+    <button id="btnModoEntrada" onclick="elegirModo('Entrada')">⬆️ Entrada</button>
+    <button id="btnModoSalida" onclick="elegirModo('Salida')">⬇️ Salida</button>
+    <button class="btn-cerrar" onclick="cerrarApp()" title="Cerrar la aplicación">Salir</button>
+  </div>
+
+  <div id="qr-reader"></div>
+  <div id="estado" class="estado">Solicitando acceso a la cámara…</div>
+  <div id="resultado"></div>
+
+  <label>O ingresar ID manualmente:</label>
+  <div class="fila">
+    <input id="inputManual" placeholder="DNI del alumno" onkeydown="if(event.key==='Enter'){marcarAsistencia(this.value); this.value='';}">
+    <button onclick="marcarAsistencia(document.getElementById('inputManual').value); document.getElementById('inputManual').value='';">Marcar</button>
+  </div>
+
+<script>
+  // URL /exec de tu implementación de Apps Script (ya corregida).
+  // ⚠️ IMPORTANTE: reemplaza esta URL por el enlace /exec del NUEVO proyecto de Apps
+  // Script que vas a crear para este sistema (Implementar → Administrar implementaciones
+  // → copiar la URL de la app web). NO uses la URL del sistema anterior — son proyectos
+  // completamente separados con hojas de cálculo distintas.
+  const URL_APPS_SCRIPT = 'https://script.google.com/macros/s/AKfycbz-bcfn8SpQXD3N2WmXLyvB_y2iBJiDR1cjXKTLcANyCOQToMRpkKg0IbSeh4Es1icO2w/exec';
+
+  const estadoDiv = document.getElementById('estado');
+  const resultadoDiv = document.getElementById('resultado');
+  let bloqueado = false;
+  let ultimoIdEscaneado = null;
+  let ultimoTimestamp = 0;
+  let scannerRef = null;
+  let modoActual = 'Entrada';
+  const COOLDOWN_MS = 2000;      // evita re-marcar al MISMO alumno antes de este tiempo
+  const RESUME_DELAY_MS = 400;   // pausa mínima de cámara, solo para no releer el mismo frame
+
+  function elegirModo(modo) {
+    modoActual = modo;
+    document.getElementById('btnModoEntrada').className = modo === 'Entrada' ? 'activo-entrada' : '';
+    document.getElementById('btnModoSalida').className = modo === 'Salida' ? 'activo-salida' : '';
+  }
+  elegirModo('Entrada'); // modo por defecto al abrir la página
+
+  // Intenta cerrar la pestaña/ventana, sin mostrar ningún mensaje de por medio.
+  // Funciona de forma confiable cuando esta página fue abierta con window.open() desde
+  // la app principal (justo como hace el botón "Iniciar cámara"). Si está instalada como
+  // app (PWA), el navegador puede bloquear el cierre por seguridad — en ese caso no pasa
+  // nada visible, simplemente la cámara queda apagada y el botón no hace más que eso.
+  function cerrarApp() {
+    if (scannerRef) {
+      try { scannerRef.stop(); } catch (e) {}
+    }
+    window.close();
+  }
+
+  function mostrarResultado(ok, texto, nombre) {
+    resultadoDiv.innerHTML =
+      '<div class="resultado ' + (ok ? 'ok' : 'error') + '">' +
+      (nombre ? '<div class="nombre">' + nombre + '</div>' : '') +
+      (ok ? '✅ ' : '⚠️ ') + texto +
+      '</div>';
+  }
+
+  function marcarAsistencia(idAlumno) {
+    idAlumno = (idAlumno || '').trim();
+    if (!idAlumno || bloqueado) return;
+
+    // Evita reenviar el mismo ID si todavía está dentro del tiempo de espera
+    // (por ejemplo, si el QR se queda varios segundos frente a la cámara).
+    // Este control es POR ALUMNO, así que no afecta a que el siguiente alumno
+    // (con un ID distinto) pueda escanear de inmediato.
+    const ahora = Date.now();
+    if (idAlumno === ultimoIdEscaneado && (ahora - ultimoTimestamp) < COOLDOWN_MS) return;
+    ultimoIdEscaneado = idAlumno;
+    ultimoTimestamp = ahora;
+
+    bloqueado = true;
+    if (scannerRef) { try { scannerRef.pause(true); } catch (e) {} }
+    estadoDiv.textContent = 'Registrando ' + modoActual + '...';
+
+    if (!URL_APPS_SCRIPT || URL_APPS_SCRIPT.indexOf('PEGA_AQUI') > -1) {
+      mostrarResultado(false, 'Falta configurar la URL de Apps Script en este archivo (variable URL_APPS_SCRIPT).');
+      bloqueado = false;
+      if (scannerRef) { try { scannerRef.resume(); } catch (e) {} }
+      estadoDiv.textContent = 'Apunta la cámara al código QR…';
+      return;
+    }
+
+    const url = URL_APPS_SCRIPT + '?accion=marcarAsistencia&idAlumno=' + encodeURIComponent(idAlumno) +
+      '&tipoMovimiento=' + encodeURIComponent(modoActual);
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        mostrarResultado(!!data.success, data.message || 'Sin respuesta del servidor.',
+          data.alumno ? data.alumno.Nombre_Completo : null);
+      })
+      .catch(err => {
+        mostrarResultado(false, 'No se pudo conectar con el servidor: ' + err.message);
+      })
+      .finally(() => {
+        // Pausa CORTA de la cámara: solo lo necesario para que no vuelva a leer el
+        // mismo frame que sigue en cuadro. El siguiente alumno (ID distinto) puede
+        // escanear de inmediato apenas se retire el QR anterior de la cámara.
+        setTimeout(() => {
+          bloqueado = false;
+          if (scannerRef) { try { scannerRef.resume(); } catch (e) {} }
+          estadoDiv.textContent = 'Apunta la cámara al código QR…';
+        }, RESUME_DELAY_MS);
+      });
+  }
+
+  if (typeof Html5Qrcode === 'undefined') {
+    estadoDiv.innerHTML = '<div class="resultado error">No se pudo cargar la librería del lector QR. Revisa tu conexión a internet.</div>';
+  } else if (!window.isSecureContext) {
+    estadoDiv.innerHTML = '<div class="resultado error">Esta página debe abrirse por HTTPS para poder usar la cámara.</div>';
+  } else {
+    Html5Qrcode.getCameras().then(camaras => {
+      if (!camaras || camaras.length === 0) {
+        estadoDiv.innerHTML = '<div class="resultado error">No se detectó ninguna cámara conectada.</div>';
+        return;
+      }
+      const trasera = camaras.find(c => /back|trasera|rear|environment/i.test(c.label || ''));
+      const elegida = trasera || camaras[0];
+      const scanner = new Html5Qrcode('qr-reader');
+      scannerRef = scanner;
+      scanner.start(
+        { deviceId: { exact: elegida.id } },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        decodedText => marcarAsistencia(decodedText),
+        () => { /* frame sin QR, ignorar */ }
+      ).then(() => { estadoDiv.textContent = 'Apunta la cámara al código QR…'; })
+       .catch(err => {
+          const nombre = (err && err.name) || String(err);
+          let ayuda = 'No se pudo acceder a la cámara (' + nombre + ').';
+          if (nombre.indexOf('NotAllowed') > -1) ayuda += ' Revisa el permiso de cámara para este sitio en tu navegador.';
+          else if (nombre.indexOf('NotReadable') > -1) ayuda += ' La cámara está siendo usada por otra aplicación.';
+          estadoDiv.innerHTML = '<div class="resultado error">' + ayuda + '</div>';
+       });
+    }).catch(err => {
+      estadoDiv.innerHTML = '<div class="resultado error">No se pudo listar las cámaras: ' + ((err && err.message) || err) + '</div>';
+    });
+  }
+
+  // Registra el service worker (necesario para que Android ofrezca "Instalar app").
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* si falla, la página sigue funcionando normal */ });
+  }
+</script>
+</body>
+</html>
